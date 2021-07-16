@@ -10,6 +10,8 @@
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE TypeOperators       #-}
 
+{-# OPTIONS_GHC -fno-warn-unused-imports #-}
+
 module Week03.Homework1 where
 
 import           Control.Monad        hiding (fmap)
@@ -18,7 +20,7 @@ import           Data.Map             as Map
 import           Data.Text            (Text)
 import           Data.Void            (Void)
 import           GHC.Generics         (Generic)
-import           Plutus.Contract      hiding (when)
+import           Plutus.Contract
 import qualified PlutusTx
 import           PlutusTx.Prelude     hiding (unless)
 import           Ledger               hiding (singleton)
@@ -28,14 +30,15 @@ import           Ledger.Ada           as Ada
 import           Playground.Contract  (printJson, printSchemas, ensureKnownCurrencies, stage, ToSchema)
 import           Playground.TH        (mkKnownCurrencies, mkSchemaDefinitions)
 import           Playground.Types     (KnownCurrency (..))
+import           Prelude              (IO)
 import qualified Prelude              as P
 import           Text.Printf          (printf)
 
 data VestingDatum = VestingDatum
     { beneficiary1 :: PubKeyHash
     , beneficiary2 :: PubKeyHash
-    , deadline     :: Slot
-    } deriving Show
+    , deadline     :: POSIXTime
+    } deriving P.Show
 
 PlutusTx.unstableMakeIsData ''VestingDatum
 
@@ -43,48 +46,59 @@ PlutusTx.unstableMakeIsData ''VestingDatum
 -- This should validate if either beneficiary1 has signed the transaction and the current slot is before or at the deadline
 -- or if beneficiary2 has signed the transaction and the deadline has passed.
 mkValidator :: VestingDatum -> () -> ScriptContext -> Bool
-mkValidator (VestingDatum beneficiary1 beneficiary2 deadline) () ctx =
-    traceIfFalse "wrong sig or deadline" checkSigandDeadline
+mkValidator dat () ctx 
+    | checkSig1 = traceIfFalse "the deadline has passed for beneficiary1" checkDeadline1 
+    | checkSig2 = traceIfFalse "the deadline has not been reached for beneficiary2" checkDeadline2
+    | otherwise = traceError "no valid beneficiary signature" 
+    
     where
-        info :: TxInfo
+        info :: TxInfo 
         info = scriptContextTxInfo ctx
 
-        checkSigandDeadline :: Bool
-        checkSigandDeadline
-            | beneficiary1 `elem` txInfoSignatories info && to        deadline `contains` txInfoValidRange info  = True
-            | beneficiary2 `elem` txInfoSignatories info && from (1 + deadline) `contains` txInfoValidRange info = True
-            | otherwise                                                                                          = False
+        checkSig1 :: Bool 
+        checkSig1 = txSignedBy info $ beneficiary1 dat
+
+        checkSig2 :: Bool 
+        checkSig2 = txSignedBy info $ beneficiary2 dat
+
+        checkDeadline1 :: Bool 
+        checkDeadline1 = contains (to $ deadline dat) $ txInfoValidRange info
+
+        checkDeadline2 :: Bool 
+        checkDeadline2 = contains (from $ deadline dat) $ txInfoValidRange info
 
 data Vesting
-instance Scripts.ScriptType Vesting where
+instance Scripts.ValidatorTypes Vesting where
     type instance DatumType Vesting = VestingDatum
     type instance RedeemerType Vesting = ()
 
-inst :: Scripts.ScriptInstance Vesting
-inst = Scripts.validator @Vesting
+typedValidator :: Scripts.TypedValidator Vesting
+typedValidator = Scripts.mkTypedValidator @Vesting
     $$(PlutusTx.compile [|| mkValidator ||])
     $$(PlutusTx.compile [|| wrap ||])
   where
     wrap = Scripts.wrapValidator @VestingDatum @()
 
 validator :: Validator
-validator = Scripts.validatorScript inst
+validator = Scripts.validatorScript typedValidator
+
+valHash :: Ledger.ValidatorHash
+valHash = Scripts.validatorHash typedValidator
 
 scrAddress :: Ledger.Address
 scrAddress = scriptAddress validator
 
 data GiveParams = GiveParams
     { gpBeneficiary :: !PubKeyHash
-    , gpDeadline    :: !Slot
+    , gpDeadline    :: !POSIXTime
     , gpAmount      :: !Integer
     } deriving (Generic, ToJSON, FromJSON, ToSchema)
 
 type VestingSchema =
-    BlockchainActions
-        .\/ Endpoint "give" GiveParams
+            Endpoint "give" GiveParams
         .\/ Endpoint "grab" ()
 
-give :: (HasBlockchainActions s, AsContractError e) => GiveParams -> Contract w s e ()
+give :: AsContractError e => GiveParams -> Contract w s e ()
 give gp = do
     pkh <- pubKeyHash <$> ownPubKey
     let dat = VestingDatum
@@ -93,21 +107,21 @@ give gp = do
                 , deadline     = gpDeadline gp
                 }
         tx  = mustPayToTheScript dat $ Ada.lovelaceValueOf $ gpAmount gp
-    ledgerTx <- submitTxConstraints inst tx
+    ledgerTx <- submitTxConstraints typedValidator tx
     void $ awaitTxConfirmed $ txId ledgerTx
-    logInfo @String $ printf "made a gift of %d lovelace to %s with deadline %s"
+    logInfo @P.String $ printf "made a gift of %d lovelace to %s with deadline %s"
         (gpAmount gp)
-        (show $ gpBeneficiary gp)
-        (show $ gpDeadline gp)
+        (P.show $ gpBeneficiary gp)
+        (P.show $ gpDeadline gp)
 
-grab :: forall w s e. (HasBlockchainActions s, AsContractError e) => Contract w s e ()
+grab :: forall w s e. AsContractError e => Contract w s e ()
 grab = do
-    now    <- currentSlot
+    now    <- currentTime
     pkh    <- pubKeyHash <$> ownPubKey
     utxos  <- utxoAt scrAddress
     let utxos1 = Map.filter (isSuitable $ \dat -> beneficiary1 dat == pkh && now <= deadline dat) utxos
         utxos2 = Map.filter (isSuitable $ \dat -> beneficiary2 dat == pkh && now >  deadline dat) utxos
-    logInfo @String $ printf "found %d gift(s) to grab" (Map.size utxos1 P.+ Map.size utxos2)
+    logInfo @P.String $ printf "found %d gift(s) to grab" (Map.size utxos1 P.+ Map.size utxos2)
     unless (Map.null utxos1) $ do
         let orefs   = fst <$> Map.toList utxos1
             lookups = Constraints.unspentOutputs utxos1 P.<>
